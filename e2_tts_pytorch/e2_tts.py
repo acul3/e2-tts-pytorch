@@ -9,31 +9,26 @@ dt - dimension text
 """
 
 from __future__ import annotations
-
-from pathlib import Path
 from random import random
 from functools import partial
 from itertools import zip_longest
 from collections import namedtuple
-
 from typing import Literal, Callable
 
-import jaxtyping
-from beartype import beartype
-
 import torch
+from torch import nn, tensor, from_numpy
 import torch.nn.functional as F
-from torch import nn, tensor, Tensor, from_numpy
 from torch.nn import Module, ModuleList, Sequential, Linear
 from torch.nn.utils.rnn import pad_sequence
 
 import torchaudio
-from torchaudio.functional import DB_to_amplitude, resample
 from torchdiffeq import odeint
 
 import einx
 from einops.layers.torch import Rearrange
 from einops import einsum, rearrange, repeat, reduce, pack, unpack
+
+from scipy.optimize import linear_sum_assignment
 
 from x_transformers import (
     Attention,
@@ -44,24 +39,85 @@ from x_transformers import (
 
 from x_transformers.x_transformers import RotaryEmbedding
 
-from vocos import Vocos
+from gateloop_transformer import SimpleGateLoopLayer
+
+from e2_tts_pytorch.tensor_typing import (
+    Float,
+    Int,
+    Bool
+)
 
 pad_sequence = partial(pad_sequence, batch_first = True)
 
 # constants
 
-class TorchTyping:
-    def __init__(self, abstract_dtype):
-        self.abstract_dtype = abstract_dtype
+E2TTSReturn = namedtuple('E2TTS', ['loss', 'cond', 'pred', 'flow', 'w', 'mask'])
 
-    def __getitem__(self, shapes: str):
-        return self.abstract_dtype[Tensor, shapes]
-
-Float = TorchTyping(jaxtyping.Float)
-Int   = TorchTyping(jaxtyping.Int)
-Bool  = TorchTyping(jaxtyping.Bool)
-
-E2TTSReturn = namedtuple('E2TTS', ['loss', 'cond', 'pred'])
+phoneme_mapping = {
+    "<BOS>": 0,
+    "<PAD>": 1,
+    "<EOS>": 2,
+    " ": 3,
+    ":": 4,
+    "ˈ": 5,
+    "a": 6,
+    "t": 7,
+    "n": 8,
+    "ɪ": 9,
+    "ə": 10,
+    "i": 11,
+    "d": 12,
+    "s": 13,
+    "ː": 14,
+    "k": 15,
+    "l": 16,
+    "m": 17,
+    "ɹ": 18,
+    "u": 19,
+    "ɛ": 20,
+    "ˌ": 21,
+    "p": 22,
+    "æ": 23,
+    "ð": 24,
+    "b": 25,
+    "ʊ": 26,
+    "z": 27,
+    "ʌ": 28,
+    "h": 29,
+    "ŋ": 30,
+    "r": 31,
+    "o": 32,
+    "w": 33,
+    "v": 34,
+    "f": 35,
+    "e": 36,
+    "ɡ": 37,
+    "j": 38,
+    "ɚ": 39,
+    "ʃ": 40,
+    "ɔ": 41,
+    "ɑ": 42,
+    ",": 43,
+    "ɐ": 44,
+    "ʒ": 45,
+    ".": 46,
+    "ᵻ": 47,
+    "ɾ": 48,
+    "ɜ": 49,
+    "ɲ": 50,
+    "θ": 51,
+    "?": 52,
+    "̩": 53,
+    "ʔ": 54,
+    "x": 55,
+    "ç": 56,
+    "!": 57,
+    "χ": 58,
+    ";": 59,
+    "̃": 60,
+    "ɬ": 61,
+    "ʲ": 62
+}
 
 # helpers
 
@@ -93,32 +149,63 @@ def list_str_to_tensor(
 
 from g2p_en import G2p
 
+extended_chars = [' ', ',', '.', '-', '!', '?', '\'', '"', '...', '..', '. .', '. . .', '. . . .', '. . . . .', '. ...', '... .', '.. ..']
+
 def get_g2p_en_encode():
     g2p = G2p()
+    
+    def get_extended_p2idx():
+        extended_p2idx = g2p.p2idx.copy()
+        
+        for p in extended_chars:
+            extended_p2idx[p] = len(extended_p2idx)
+        
+        return extended_p2idx
 
-    # used by @lucasnewman successfully here
-    # https://github.com/lucasnewman/e2-tts-pytorch/blob/ljspeech-test/e2_tts_pytorch/e2_tts.py
-
-    phoneme_to_index = g2p.p2idx
-    num_phonemes = len(phoneme_to_index)
-
-    extended_chars = [' ', ',', '.', '-', '!', '?', '\'', '"', '...', '..', '. .', '. . .', '. . . .', '. . . . .', '. ...', '... .', '.. ..']
-    num_extended_chars = len(extended_chars)
-
-    extended_chars_dict = {p: (num_phonemes + i) for i, p in enumerate(extended_chars)}
-    phoneme_to_index = {**phoneme_to_index, **extended_chars_dict}
+    g2p.extended_p2idx = get_extended_p2idx()
 
     def encode(
         text: list[str],
         padding_value = -1
     ) -> Int['b nt']:
-
+        #print(text)
         phonemes = [g2p(t) for t in text]
-        list_tensors = [tensor([phoneme_to_index[p] for p in one_phoneme]) for one_phoneme in phonemes]
+        try:
+            list_tensors = [tensor([g2p.extended_p2idx[p] for p in one_phoneme]) for one_phoneme in phonemes]
+        except KeyError as e:
+            print(f"KeyError: {e}")
+            print(f"phonemes: {phonemes}")
+            raise e
         padded_tensor = pad_sequence(list_tensors, padding_value = -1)
         return padded_tensor
 
-    return encode, (num_phonemes + num_extended_chars)
+    return encode
+
+
+def get_g2p_enid_encode():
+    #g2p = G2p()
+
+    extended_p2idx = phoneme_mapping
+    #print(extended_p2idx)
+    
+    def encode(
+        text: list[str],
+        padding_value = -1
+    ) -> Int['b nt']:
+        #print(text)
+        phonemes = [list(t) for t in text]
+        try:
+            idku = [[extended_p2idx[p] for p in one_phoneme] for one_phoneme in phonemes]
+            list_tensors = [tensor([extended_p2idx[p] for p in one_phoneme]) for one_phoneme in phonemes]
+        except KeyError as e:
+            print(f"KeyError: {e}")
+            print(f"phonemes: {phonemes}")
+            raise e
+        padded_tensor = pad_sequence(list_tensors, padding_value = -1)
+        #print(padded_tensor)
+        return padded_tensor
+
+    return encode
 
 # tensor helpers
 
@@ -189,15 +276,6 @@ def pad_to_length(
 
     return t[..., :length]
 
-def interpolate_1d(
-    x: Tensor,
-    length: int,
-    mode = 'bilinear'
-):
-    x = rearrange(x, 'n d -> 1 d n 1')
-    x = F.interpolate(x, (length, 1), mode = mode)
-    return rearrange(x, '1 d n 1 -> n d')
-
 # to mel spec
 
 class MelSpec(Module):
@@ -215,7 +293,6 @@ class MelSpec(Module):
     ):
         super().__init__()
         self.n_mel_channels = n_mel_channels
-        self.sampling_rate = sampling_rate
 
         self.mel_stft = torchaudio.transforms.MelSpectrogram(
             sample_rate = sampling_rate,
@@ -296,7 +373,6 @@ class CharacterEmbed(Module):
         self,
         text: Int['b nt'],
         max_seq_len: int,
-        **kwargs
     ) -> Float['b n d']:
 
         text = text + 1 # shift all other token ids up by 1 and use 0 as filler token
@@ -306,77 +382,6 @@ class CharacterEmbed(Module):
 
         return self.embed(text)
 
-class InterpolatedCharacterEmbed(Module):
-    def __init__(
-        self,
-        dim,
-        num_embeds = 256,
-    ):
-        super().__init__()
-        self.dim = dim
-        self.embed = nn.Embedding(num_embeds, dim)
-
-        self.abs_pos_mlp = Sequential(
-            Rearrange('... -> ... 1'),
-            Linear(1, dim),
-            nn.SiLU(),
-            Linear(dim, dim)
-        )
-
-    def forward(
-        self,
-        text: Int['b nt'],
-        max_seq_len: int,
-        mask: Bool['b n'] | None = None
-    ) -> Float['b n d']:
-
-        device = text.device
-        seq = torch.arange(max_seq_len, device = device)
-
-        mask = default(mask, (None,))
-
-        interp_embeds = []
-        interp_abs_positions = []
-
-        for one_text, one_mask in zip_longest(text, mask):
-
-            valid_text = one_text >= 0
-            one_text = one_text[valid_text]
-            one_text_embed = self.embed(one_text)
-
-            # save the absolute positions
-
-            text_seq_len = one_text.shape[0]
-
-            # determine audio sequence length from mask
-
-            audio_seq_len = max_seq_len
-            if exists(one_mask):
-                audio_seq_len = one_mask.sum().long().item()
-
-            # interpolate text embedding to audio embedding length
-
-            interp_text_embed = interpolate_1d(one_text_embed, audio_seq_len)
-            interp_abs_pos = torch.linspace(0, text_seq_len, audio_seq_len, device = device)
-
-            interp_embeds.append(interp_text_embed)
-            interp_abs_positions.append(interp_abs_pos)
-
-        interp_embeds = pad_sequence(interp_embeds)
-        interp_abs_positions = pad_sequence(interp_abs_positions)
-
-        interp_embeds = F.pad(interp_embeds, (0, 0, 0, max_seq_len - interp_embeds.shape[-2]))
-        interp_abs_positions = pad_to_length(interp_abs_positions, max_seq_len)
-
-        # pass interp absolute positions through mlp for implicit positions
-
-        interp_embeds = interp_embeds + self.abs_pos_mlp(interp_abs_positions)
-
-        if exists(mask):
-            interp_embeds = einx.where('b n, b n d, -> b n d', mask, interp_embeds, 0.)
-
-        return interp_embeds
-
 # text audio cross conditioning in multistream setup
 
 class TextAudioCrossCondition(Module):
@@ -384,7 +389,7 @@ class TextAudioCrossCondition(Module):
         self,
         dim,
         dim_text,
-        cond_audio_to_text = True,
+        cond_audio_to_text = True
     ):
         super().__init__()
         self.text_to_audio = nn.Linear(dim_text + dim, dim, bias = False)
@@ -412,7 +417,6 @@ class TextAudioCrossCondition(Module):
 # for use in both e2tts as well as duration module
 
 class Transformer(Module):
-    @beartype
     def __init__(
         self,
         *,
@@ -427,6 +431,7 @@ class Transformer(Module):
         text_dim_head = None,
         text_ff_mult = None,
         cond_on_time = True,
+        skip_connect_type: Literal['add', 'concat', 'none'] = 'concat',
         abs_pos_emb = True,
         max_seq_len = 8192,
         dropout = 0.1,
@@ -436,6 +441,7 @@ class Transformer(Module):
             softclamp_logits = True,
         ),
         ff_kwargs: dict = dict(),
+        use_gateloop = False
     ):
         super().__init__()
         assert divisible_by(depth, 2), 'depth needs to be even'
@@ -456,6 +462,9 @@ class Transformer(Module):
         text_depth = default(text_depth, depth)
 
         assert 1 <= text_depth <= depth, 'must have at least 1 layer of text conditioning, but less than total number of speech layers'
+
+        self.skip_connect_type = skip_connect_type
+        needs_skip_proj = skip_connect_type == 'concat'
 
         self.depth = depth
         self.layers = ModuleList([])
@@ -496,6 +505,8 @@ class Transformer(Module):
 
             # speech related
 
+            gateloop = SimpleGateLoopLayer(dim = dim) if use_gateloop else None
+
             attn_norm = rmsnorm_klass(dim)
             attn = Attention(dim = dim, heads = heads, dim_head = dim_head, dropout = dropout, **attn_kwargs)
             attn_adaln_zero = postbranch_klass()
@@ -504,9 +515,10 @@ class Transformer(Module):
             ff = FeedForward(dim = dim, glu = True, mult = ff_mult, dropout = dropout, **ff_kwargs)
             ff_adaln_zero = postbranch_klass()
 
-            skip_proj = Linear(dim * 2, dim, bias = False) if is_later_half else None
+            skip_proj = Linear(dim * 2, dim, bias = False) if needs_skip_proj and is_later_half else None
 
             speech_modules = ModuleList([
+                gateloop,
                 skip_proj,
                 attn_norm,
                 attn,
@@ -521,6 +533,8 @@ class Transformer(Module):
             if has_text:
                 # text related
 
+                text_gateloop = SimpleGateLoopLayer(dim = dim_text) if use_gateloop else None
+
                 text_attn_norm = RMSNorm(dim_text)
                 text_attn = Attention(dim = dim_text, heads = text_heads, dim_head = text_dim_head, dropout = dropout, **attn_kwargs)
 
@@ -534,6 +548,7 @@ class Transformer(Module):
                 cross_condition = TextAudioCrossCondition(dim = dim, dim_text = dim_text, cond_audio_to_text = not is_last)
 
                 text_modules = ModuleList([
+                    text_gateloop,
                     text_attn_norm,
                     text_attn,
                     text_ff_norm,
@@ -599,6 +614,8 @@ class Transformer(Module):
 
         # skip connection related stuff
 
+        skip_connect_type = self.skip_connect_type
+
         skips = []
 
         # go through the layers
@@ -607,6 +624,7 @@ class Transformer(Module):
             layer = ind + 1
 
             (
+                gateloop,
                 maybe_skip_proj,
                 attn_norm,
                 attn,
@@ -621,12 +639,16 @@ class Transformer(Module):
             if exists(text_embed) and exists(text_modules):
 
                 (
+                    text_gateloop,
                     text_attn_norm,
                     text_attn,
                     text_ff_norm,
                     text_ff,
                     cross_condition
                 ) = text_modules
+
+                if exists(text_gateloop):
+                    text_embed = text_gateloop(text_embed) + text_embed
 
                 text_embed = text_attn(text_attn_norm(text_embed), rotary_pos_emb = text_rotary_pos_emb, mask = mask) + text_embed
 
@@ -644,8 +666,19 @@ class Transformer(Module):
 
             if is_later_half:
                 skip = skips.pop()
-                x = torch.cat((x, skip), dim = -1)
-                x = maybe_skip_proj(x)
+
+                if skip_connect_type == 'concat':
+                    # concatenative
+                    x = torch.cat((x, skip), dim = -1)
+                    x = maybe_skip_proj(x)
+                elif skip_connect_type == 'add':
+                    # additive
+                    x = x + skip
+
+            # maybe associative scan
+
+            if exists(gateloop):
+                x = gateloop(x) + x
 
             # attention and feedforward blocks
 
@@ -666,7 +699,6 @@ class Transformer(Module):
 # main classes
 
 class DurationPredictor(Module):
-    @beartype
     def __init__(
         self,
         transformer: dict | Transformer,
@@ -674,10 +706,7 @@ class DurationPredictor(Module):
         mel_spec_kwargs: dict = dict(),
         char_embed_kwargs: dict = dict(),
         text_num_embeds = None,
-        tokenizer: (
-            Literal['char_utf8', 'phoneme_en'] |
-            Callable[[list[str]], Int['b nt']]
-        ) = 'char_utf8'
+        tokenizer: str |  Callable[[list[str]], Int['b nt']] = 'char_utf8'
     ):
         super().__init__()
 
@@ -693,10 +722,7 @@ class DurationPredictor(Module):
         self.num_channels = default(num_channels, self.mel_spec.n_mel_channels)
 
         self.transformer = transformer
-
         dim = transformer.dim
-        dim_text = transformer.dim_text
-
         self.dim = dim
 
         self.proj_in = Linear(self.num_channels, self.dim)
@@ -710,11 +736,15 @@ class DurationPredictor(Module):
             text_num_embeds = 256
             self.tokenizer = list_str_to_tensor
         elif tokenizer == 'phoneme_en':
-            self.tokenizer, text_num_embeds = get_g2p_en_encode()
+            text_num_embeds = 74 + len(extended_chars)
+            self.tokenizer = get_g2p_en_encode()
+        elif tokenizer == 'custom_id':
+            text_num_embeds = 63
+            self.tokenizer = get_g2p_enid_encode()
         else:
             raise ValueError(f'unknown tokenizer string {tokenizer}')
 
-        self.embed_text = CharacterEmbed(dim_text, num_embeds = text_num_embeds, **char_embed_kwargs)
+        self.embed_text = CharacterEmbed(transformer.dim_text, num_embeds = text_num_embeds, **char_embed_kwargs)
 
         # to prediction
 
@@ -791,11 +821,13 @@ class DurationPredictor(Module):
 
         return F.mse_loss(pred, lens.float())
 
+def noise_schedule(t, s=0.008):
+    return t ** 2
+    
 class E2TTS(Module):
-
-    @beartype
     def __init__(
         self,
+        sigma = 0.,
         transformer: dict | Transformer = None,
         duration_predictor: dict | DurationPredictor | None = None,
         odeint_kwargs: dict = dict(
@@ -810,15 +842,10 @@ class E2TTS(Module):
         mel_spec_kwargs: dict = dict(),
         frac_lengths_mask: tuple[float, float] = (0.7, 1.),
         concat_cond = False,
-        interpolated_text = False,
-        text_num_embeds: int | None = None,
-        tokenizer: (
-            Literal['char_utf8', 'phoneme_en'] |
-            Callable[[list[str]], Int['b nt']]
-        ) = 'char_utf8',
-        use_vocos = True,
-        pretrained_vocos_path = 'charactr/vocos-mel-24khz',
-        sampling_rate: int | None = None
+        immiscible = False,
+        text_num_embeds = None,
+        tokenizer: str |  Callable[[list[str]], Int['b nt']] = 'char_utf8',
+        use_noise_schedule = False
     ):
         super().__init__()
 
@@ -843,6 +870,10 @@ class E2TTS(Module):
 
         self.duration_predictor = duration_predictor
 
+        # conditional flow related
+
+        self.sigma = sigma
+
         # sampling
 
         self.odeint_kwargs = odeint_kwargs
@@ -853,7 +884,6 @@ class E2TTS(Module):
         num_channels = default(num_channels, self.mel_spec.n_mel_channels)
  
         self.num_channels = num_channels
-        self.sampling_rate = default(sampling_rate, getattr(self.mel_spec, 'sampling_rate', None))
 
         # whether to concat condition and project rather than project both and sum
 
@@ -878,7 +908,11 @@ class E2TTS(Module):
             text_num_embeds = 256
             self.tokenizer = list_str_to_tensor
         elif tokenizer == 'phoneme_en':
-            self.tokenizer, text_num_embeds = get_g2p_en_encode()
+            text_num_embeds = 74 + len(extended_chars)
+            self.tokenizer = get_g2p_en_encode()
+        elif tokenizer == 'custom_id':
+            text_num_embeds = 63
+            self.tokenizer = get_g2p_enid_encode()
         else:
             raise ValueError(f'unknown tokenizer string {tokenizer}')
 
@@ -886,17 +920,22 @@ class E2TTS(Module):
 
         # text embedding
 
-        text_embed_klass = CharacterEmbed if not interpolated_text else InterpolatedCharacterEmbed
+        self.embed_text = CharacterEmbed(dim_text, num_embeds = text_num_embeds, **char_embed_kwargs)
 
-        self.embed_text = text_embed_klass(dim_text, num_embeds = text_num_embeds, **char_embed_kwargs)
+        # immiscible flow - https://arxiv.org/abs/2406.12303
 
-        # default vocos for mel -> audio
-
-        self.vocos = Vocos.from_pretrained(pretrained_vocos_path) if use_vocos else None
+        self.immiscible = immiscible
+        self.use_noise_schedule = use_noise_schedule
 
     @property
     def device(self):
         return next(self.parameters()).device
+
+    def sample_times(self, batch_size, dtype, device):
+        times = torch.rand((batch_size,), dtype = dtype, device = device)
+        if self.use_noise_schedule:
+            times = noise_schedule(times)
+        return times
 
     def transformer_with_pred_head(
         self,
@@ -927,7 +966,7 @@ class E2TTS(Module):
 
         text_embed = None
         if exists(text) and not drop_text_cond:
-            text_embed = self.embed_text(text, seq_len, mask = mask)
+            text_embed = self.embed_text(text, seq_len)
 
         # attend
 
@@ -967,12 +1006,7 @@ class E2TTS(Module):
         steps = 32,
         cfg_strength = 1.,   # they used a classifier free guidance strength of 1.
         max_duration = 4096, # in case the duration predictor goes haywire
-        vocoder: Callable[[Float['b d n']], list[Float['_']]] | None = None,
-        return_raw_output: bool | None = None,
-        save_to_filename: str | None = None
-    ) -> (
-        Float['b n d'],
-        list[Float['_']]
+        vocoder: Callable[Float['b d n'], Float['b nw']] | None = None
     ):
         self.eval()
 
@@ -1007,13 +1041,10 @@ class E2TTS(Module):
                 duration = torch.full((batch,), duration, device = device, dtype = torch.long)
 
         elif exists(self.duration_predictor):
-            duration = self.duration_predictor(cond, text = text, lens = lens, return_loss = False).long()
+            duration = self.duration_predictor(cond, text = text, lens = lens).long()
 
         duration = torch.maximum(lens + 1, duration) # just add one token so something is generated
         duration = duration.clamp(max = max_duration)
-
-        assert duration.shape[0] == batch
-
         max_duration = duration.amax()
 
         cond = F.pad(cond, (0, 0, 0, max_duration - cond_seq_len), value = 0.)
@@ -1025,6 +1056,8 @@ class E2TTS(Module):
         # neural ode
 
         def fn(t, x):
+            print(f"Predicting for t: {t}")
+            
             # at each step, conditioning is fixed
 
             step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
@@ -1050,43 +1083,9 @@ class E2TTS(Module):
 
         out = torch.where(cond_mask, cond, out)
 
-        # able to return raw untransformed output, if not using mel rep
-
-        if exists(return_raw_output) and return_raw_output:
-            return out
-
-        # take care of transforming mel to audio if `vocoder` is passed in, or if `use_vocos` is turned on
-
         if exists(vocoder):
-            assert not exists(self.vocos), '`use_vocos` should not be turned on if you are passing in a custom `vocoder` on sampling'
             out = rearrange(out, 'b n d -> b d n')
             out = vocoder(out)
-
-        elif exists(self.vocos):
-
-            audio = []
-            for mel, one_mask in zip(out, mask):
-                one_out = DB_to_amplitude(mel[one_mask], ref = 1., power = 0.5)
-
-                one_out = rearrange(one_out, 'n d -> 1 d n')
-                one_audio = self.vocos.decode(one_out)
-                one_audio = rearrange(one_audio, '1 nw -> nw')
-                audio.append(one_audio)
-
-            out = audio
-
-        if exists(save_to_filename):
-            assert exists(vocoder) or exists(self.vocos)
-            assert exists(self.sampling_rate)
-
-            path = Path(save_to_filename)
-            parent_path = path.parents[0]
-            parent_path.mkdir(exist_ok = True, parents = True)
-
-            for ind, one_audio in enumerate(out):
-                one_audio = rearrange(one_audio, 'nw -> 1 nw')
-                save_path = str(parent_path / f'{ind + 1}.{path.name}')
-                torchaudio.save(save_path, one_audio.detach().cpu(), sample_rate = self.sampling_rate)
 
         return out
 
@@ -1105,7 +1104,7 @@ class E2TTS(Module):
             inp = rearrange(inp, 'b d n -> b n d')
             assert inp.shape[-1] == self.num_channels
 
-        batch, seq_len, dtype, device = *inp.shape[:2], inp.dtype, self.device
+        batch, seq_len, dtype, device, σ = *inp.shape[:2], inp.dtype, self.device, self.sigma
 
         # handle text as string
 
@@ -1139,16 +1138,27 @@ class E2TTS(Module):
 
         x0 = torch.randn_like(x1)
 
+        # maybe immiscible flow
+
+        if self.immiscible:
+            cost = torch.cdist(x1.flatten(1), x0.flatten(1))
+            _, reorder_indices = linear_sum_assignment(cost.cpu())
+            x0 = x0[from_numpy(reorder_indices).to(cost.device)]
+
         # t is random times from above
 
         times = torch.rand((batch,), dtype = dtype, device = self.device)
+
+        if self.use_noise_schedule:
+            times = noise_schedule(times)
+
         t = rearrange(times, 'b -> b 1 1')
 
         # sample xt (w in the paper)
 
-        w = (1. - t) * x0 + t * x1
+        w = (1 - (1 - σ) * t) * x0 + t * x1
 
-        flow = x1 - x0
+        flow = x1 - (1 - σ) * x0
 
         # only predict what is within the random mask span for infilling
 
@@ -1168,4 +1178,4 @@ class E2TTS(Module):
 
         loss = loss[rand_span_mask].mean()
 
-        return E2TTSReturn(loss, cond, pred)
+        return E2TTSReturn(loss, cond, pred.detach(), flow, w, rand_span_mask)
